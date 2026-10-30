@@ -1,116 +1,187 @@
 #include <Arduino.h>
 
-// --- НАСТРОЙКА ПИНОВ (Header 1 на WeAct Black Pill V1.2) ---
-const uint8_t PIN_SIGNAL_IN  = PA0;  // Вход управляющего сигнала
+// ================= 1. НАСТРОЙКА ПИНОВ (Black Pill F401CC) =================
+const uint8_t PIN_CAMERA_IN  = PA0;  // Вход сигнала от камеры
+const uint8_t PIN_TA12_ADC   = PA1;  // Аналоговый вход датчика тока TA12-200
 
-const uint8_t PIN_OUT_1      = PB0;  // Выход 1 (активен, когда сигнал ЕСТЬ)
-const uint8_t PIN_OUT_2      = PB1;  // Выход 2 (активен, когда сигнала НЕТ)
+const uint8_t PIN_OUT_OP     = PB0;  // Линия OP (Открытие/Старт) - по умолчанию РАЗОМКНУТА
+const uint8_t PIN_OUT_PH     = PB1;  // Линия PH (Оптическая)     - по умолчанию ЗАМКНУТА
 
-const uint8_t PIN_LED_OUT_1  = PA6;  // Внешний светодиод Выхода 1
-const uint8_t PIN_LED_OUT_2  = PA7;  // Внешний светодиод Выхода 2
-const uint8_t PIN_BOARD_LED  = PC13; // Встроенный светодиод на плате (Active LOW)
+const uint8_t PIN_LED_OP     = PA6;  // Светодиод индикации OP
+const uint8_t PIN_LED_PH     = PA7;  // Светодиод индикации PH (горит, когда замкнута)
+const uint8_t PIN_BOARD_LED  = PC13; // Встроенный светодиод платы (Active LOW)
 
-// --- НАСТРОЙКА ЛОГИКИ И ТАЙМИНГОВ ---
-// Поставьте false, если ваш модуль реле из набора Arduino включается низким уровнем (LOW)
-const bool RELAY_ACTIVE_HIGH = true; 
+// ================= 2. НАСТРОЙКА РЕЛЕ И ВРЕМЕНИ =================
+const bool RELAY_ACTIVE_HIGH = true;  // Поставьте false, если реле включается низким уровнем (LOW)
 
-const uint32_t DEBOUNCE_MS   = 25;    // Фильтр дребезга входного сигнала (25 мс)
-const uint32_t DEAD_TIME_MS  = 5;     // Защитная пауза между переключением каналов (5 мс)
-const uint32_t LOCK_TIME_MS  = 25000; // Минимальное время работы канала: 25 секунд (25 000 мс)
+const uint32_t DEBOUNCE_MS   = 25;    // Фильтр дребезга входа камеры (25 мс)
+const uint32_t DEAD_TIME_MS  = 5;     // Защитная пауза переключения (5 мс)
+const uint32_t LOCK_TIME_MS  = 25000; // Блокировка входа на 25 секунд
 
-// Вспомогательные уровни для управления выходами
+// Параметры датчика тока TA12-200
+const float V_REF            = 3.3f;
+const float ADC_MAX_VALUE    = 4095.0f;
+const float R_LOAD           = 800.0f;
+const float TURNS_RATIO      = 2000.0f;
+const float WIRE_TURNS       = 1.0f;
+
+// Порог определения работы мотора (0.15 А)
+const float MOTOR_CURRENT_THRESHOLD_A = 0.15f;
+const uint32_t CURRENT_WINDOW_MS      = 100;
+
+// ================= 3. ПЕРЕМЕННЫЕ СОСТОЯНИЯ =================
 const uint8_t RELAY_ON  = RELAY_ACTIVE_HIGH ? HIGH : LOW;
 const uint8_t RELAY_OFF = RELAY_ACTIVE_HIGH ? LOW  : HIGH;
 
-// Переменные состояния
-bool currentSignalState   = false; // Какой канал сейчас включен
-bool lastRawSignal        = false; // Предыдущее сырое чтение для антидребезга
-uint32_t lastDebounceTime = 0;
+uint32_t adcWindowStart     = 0;
+int currentWindowMaxADC     = 0;
+int adcMinVal               = 4095;
+float latestMotorCurrentRMS = 0.0f;
+bool isMotorRunning         = false;
 
-bool isLocked             = false; // Флаг 25-секундной блокировки
-uint32_t lockStartTime    = 0;     // Время старта 25-секундного таймера
+bool lastRawCamera          = false;
+bool stableCameraState      = false;
+uint32_t lastDebounceTime   = 0;
 
-// Функция безопасного переключения каналов и запуска блокировки на 25 секунд
-void switchChannels(bool signalPresent) {
-    // Шаг 1: Break-Before-Make — отключаем ОБА выхода и гасим оба внешних светодиода
-    digitalWrite(PIN_OUT_1, RELAY_OFF);
-    digitalWrite(PIN_OUT_2, RELAY_OFF);
-    digitalWrite(PIN_LED_OUT_1, LOW);
-    digitalWrite(PIN_LED_OUT_2, LOW);
-    
-    // Ждём защитную паузу (5 мс)
+bool isLocked               = false;
+uint32_t lockStartTime      = 0;
+
+// --- СОСТОЯНИЕ ПО УМОЛЧАНИЮ: PH замкнута (горит A7), OP разомкнут (гашен A6) ---
+void setDefaultState() {
+    digitalWrite(PIN_OUT_OP, RELAY_OFF);
+    digitalWrite(PIN_LED_OP, LOW);       // OP выключен
+
     delay(DEAD_TIME_MS);
 
-    // Шаг 2: Включаем нужный канал и его светодиод
-    if (signalPresent) {
-        // Сигнал ЕСТЬ -> работает Выход 1 (PB0) и светится Светодиод 1 (PA6)
-        digitalWrite(PIN_OUT_1, RELAY_ON);
-        digitalWrite(PIN_LED_OUT_1, HIGH);
-    } else {
-        // Сигнала НЕТ -> работает Выход 2 (PB1) и светится Светодиод 2 (PA7)
-        digitalWrite(PIN_OUT_2, RELAY_ON);
-        digitalWrite(PIN_LED_OUT_2, HIGH);
-    }
+    digitalWrite(PIN_OUT_PH, RELAY_ON);
+    digitalWrite(PIN_LED_PH, HIGH);      // PH всегда замкнута по умолчанию
+}
 
-    // Шаг 3: Включаем блокировку входа на 25 секунд
-    isLocked = true;
-    lockStartTime = millis();
+// --- СЦЕНАРИЙ 1: ТОКА НЕТ (ворота стоят) -> Подаем сигнал на OP, PH остается замкнут ---
+void triggerActionGateIdle() {
+    digitalWrite(PIN_OUT_PH, RELAY_ON);  // PH остается замкнутым
+    digitalWrite(PIN_LED_PH, HIGH);
+
+    digitalWrite(PIN_OUT_OP, RELAY_ON);  // Подаем сигнал на OP
+    digitalWrite(PIN_LED_OP, HIGH);
+}
+
+// --- СЦЕНАРИЙ 2: ТОК ЕСТЬ (ворота движутся) -> Разрываем PH, OP выключен ---
+void triggerActionGateMoving() {
+    digitalWrite(PIN_OUT_OP, RELAY_OFF); // OP выключен
+    digitalWrite(PIN_LED_OP, LOW);
+
+    delay(DEAD_TIME_MS);
+
+    digitalWrite(PIN_OUT_PH, RELAY_OFF); // Разрываем оптическую линию PH
+    digitalWrite(PIN_LED_PH, LOW);       // Гасим светодиод PH
+}
+
+// --- Неблокирующий фоновый опрос датчика тока TA12-200 ---
+void updateCurrentSensor() {
+    int adcVal = analogRead(PIN_TA12_ADC);
+    if (adcVal > currentWindowMaxADC) currentWindowMaxADC = adcVal;
+    if (adcVal < adcMinVal)           adcMinVal = adcVal;
+
+    uint32_t now = millis();
+    if ((now - adcWindowStart) >= CURRENT_WINDOW_MS) {
+        int peakToPeak = currentWindowMaxADC - adcMinVal;
+        float iMax = ((float)peakToPeak / ADC_MAX_VALUE) * (V_REF / R_LOAD) * TURNS_RATIO;
+        latestMotorCurrentRMS = (iMax / 1.4142f) / WIRE_TURNS;
+
+        if (latestMotorCurrentRMS < 0.05f) {
+            latestMotorCurrentRMS = 0.0f;
+        }
+
+        isMotorRunning = (latestMotorCurrentRMS >= MOTOR_CURRENT_THRESHOLD_A);
+
+        currentWindowMaxADC = 0;
+        adcMinVal = 4095;
+        adcWindowStart = now;
+    }
 }
 
 void setup() {
-    // Вход с внутренней подтяжкой к земле (GND)
-    pinMode(PIN_SIGNAL_IN, INPUT_PULLDOWN);
+    analogReadResolution(12);
 
-    // Силовые выходы
-    pinMode(PIN_OUT_1, OUTPUT);
-    pinMode(PIN_OUT_2, OUTPUT);
+    pinMode(PIN_CAMERA_IN, INPUT_PULLDOWN);
+    pinMode(PIN_TA12_ADC, INPUT_PULLDOWN);
 
-    // Светодиоды индикации
-    pinMode(PIN_LED_OUT_1, OUTPUT);
-    pinMode(PIN_LED_OUT_2, OUTPUT);
+    pinMode(PIN_OUT_OP, OUTPUT);
+    pinMode(PIN_OUT_PH, OUTPUT);
+
+    pinMode(PIN_LED_OP, OUTPUT);
+    pinMode(PIN_LED_PH, OUTPUT);
     pinMode(PIN_BOARD_LED, OUTPUT);
 
-    // Считываем состояние при подаче питания и сразу запускаем соответствующий канал на 25 сек
-    currentSignalState = (digitalRead(PIN_SIGNAL_IN) == HIGH);
-    lastRawSignal      = currentSignalState;
-    switchChannels(currentSignalState);
+    setDefaultState();
+
+    // Первичный замер тока при старте
+    uint32_t startupBegin = millis();
+    adcWindowStart = startupBegin;
+    while ((millis() - startupBegin) < 120) {
+        updateCurrentSensor();
+    }
+
+    lastRawCamera = (digitalRead(PIN_CAMERA_IN) == HIGH);
+    stableCameraState = lastRawCamera;
+    
 }
 
 void loop() {
     uint32_t now = millis();
 
-    // 1. ОБРАБОТКА 25-СЕКУНДНОЙ БЛОКИРОВКИ
+    // 1. Постоянный фоновый замер тока
+    updateCurrentSensor();
+
+    // 2. Проверка 25-секундной блокировки
     if (isLocked) {
         if ((now - lockStartTime) < LOCK_TIME_MS) {
-            // Пока идут 25 секунд:
-            // - Синий светодиод на плате (PC13) быстро мигает (раз в 250 мс), сигнализируя о блокировке
-            // - Любые изменения на входе PA0 полностью игнорируются (return)
+            // Во время блокировки синий светодиод на плате (PC13) быстро мигает[cite: 1, 2],
+            // а любые новые сигналы с камеры игнорируются.
             bool blink = ((now / 250) % 2) == 0;
             digitalWrite(PIN_BOARD_LED, blink ? LOW : HIGH);
-            return; 
+            return;
         } else {
-            // 25 секунд прошли — снимаем блокировку!
+            // 25 секунд истекли — возвращаем всё в исходное состояние по умолчанию
             isLocked = false;
-            // Переводим светодиод PC13 в штатный режим (горит при Выходе 1, погашен при Выходе 2)
-            digitalWrite(PIN_BOARD_LED, currentSignalState ? LOW : HIGH);
-            // Обновляем точку отсчёта антидребезга по фактическому состоянию пина PA0
-            lastRawSignal = (digitalRead(PIN_SIGNAL_IN) == HIGH);
+            setDefaultState();
+
+            lastRawCamera = (digitalRead(PIN_CAMERA_IN) == HIGH);
+            stableCameraState = lastRawCamera;
             lastDebounceTime = now;
         }
     }
 
-    // 2. ОПРОС ВХОДА PA0 (работает только после окончания 25 секунд)
-    bool rawSignal = (digitalRead(PIN_SIGNAL_IN) == HIGH);
+    // В дежурном режиме синий светодиод PC13 горит, если через мотор идет ток
+    digitalWrite(PIN_BOARD_LED, isMotorRunning ? LOW : HIGH);
 
-    if (rawSignal != lastRawSignal) {
+    // 3. Чтение сигнала с камеры (с защитой от дребезга)
+    bool rawCamera = (digitalRead(PIN_CAMERA_IN) == HIGH);
+
+    if (rawCamera != lastRawCamera) {
         lastDebounceTime = now;
-        lastRawSignal = rawSignal;
+        lastRawCamera = rawCamera;
     }
 
     if ((now - lastDebounceTime) >= DEBOUNCE_MS) {
-        if (rawSignal != currentSignalState) {
-            currentSignalState = rawSignal;
-            switchChannels(currentSignalState);
+        if (rawCamera != stableCameraState) {
+            stableCameraState = rawCamera;
+
+            // Как только пришел сигнал с камеры
+            if (stableCameraState) {
+                if (!isMotorRunning) {
+                    // Тока нет (ворота стоят) -> OP включается, PH остается замкнутым
+                    triggerActionGateIdle();
+                } else {
+                    // Ток есть (ворота идут) -> PH разрывается, OP выключен
+                    triggerActionGateMoving();
+                }
+
+                // Запускаем блокировку входа на 25 секунд
+                isLocked = true;
+                lockStartTime = now;
+            }
         }
     }
 }
