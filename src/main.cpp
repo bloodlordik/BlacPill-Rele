@@ -12,7 +12,9 @@ const uint8_t PIN_LED_PH     = PA7;  // Светодиод индикации PB
 const uint8_t PIN_BOARD_LED  = PC13; // Встроенный светодиод платы (Active LOW: LOW = горит)
 
 // ================= 2. НАСТРОЙКА РЕЛЕ И ВРЕМЕНИ =================
-const bool RELAY_ACTIVE_HIGH = true;  // Поставьте false, если реле включается уровнем LOW
+// Если реле включается логической единицей (HIGH / 3.3V) -> true
+// Если реле с оптопарой и включается нулем (LOW / 0V) -> false
+const bool RELAY_ACTIVE_HIGH = false;  
 
 const uint32_t DEBOUNCE_MS   = 25;    // Антидребезг входа PA0 (25 мс)
 const uint32_t DEAD_TIME_MS  = 5;     // Защитная пауза переключения (5 мс)
@@ -45,7 +47,7 @@ uint32_t lastDebounceTime   = 0;
 bool isLocked               = false;
 uint32_t lockStartTime      = 0;
 
-// --- СОСТОЯНИЕ ПО УМОЛЧАНИЮ: обе линии PB0 и PB1 РАЗОМКНУТЫ ---
+// --- СОСТОЯНИЕ ПО УМОЛЧАНИЮ: обе линии PB0 и PB1 РАЗОМКНУТЫ (ВЫКЛЮЧЕНЫ) ---
 void setDefaultState() {
     digitalWrite(PIN_OUT_OP, RELAY_OFF);
     digitalWrite(PIN_LED_OP, LOW);
@@ -56,7 +58,7 @@ void setDefaultState() {
     digitalWrite(PIN_LED_PH, LOW);
 }
 
-// --- СЦЕНАРИЙ 1: ТОКА НЕТ -> Подаем сигнал на PB0, PB1 разомкнут ---
+// --- СЦЕНАРИЙ 1: ТОКА НЕТ -> Включаем PB0, PB1 разомкнут ---
 void triggerActionNoCurrent() {
     digitalWrite(PIN_OUT_PH, RELAY_OFF);
     digitalWrite(PIN_LED_PH, LOW);
@@ -67,7 +69,7 @@ void triggerActionNoCurrent() {
     digitalWrite(PIN_LED_OP, HIGH);
 }
 
-// --- СЦЕНАРИЙ 2: ТОК ЕСТЬ -> Подаем сигнал на PB1, PB0 разомкнут ---
+// --- СЦЕНАРИЙ 2: ТОК ЕСТЬ -> Включаем PB1, PB0 разомкнут ---
 void triggerActionWithCurrent() {
     digitalWrite(PIN_OUT_OP, RELAY_OFF);
     digitalWrite(PIN_LED_OP, LOW);
@@ -78,23 +80,10 @@ void triggerActionWithCurrent() {
     digitalWrite(PIN_LED_PH, HIGH);
 }
 
-// --- Безопасное чтение АЦП с принудительным разрядом паразитной ёмкости пина ---
-int readTa12Adc() {
-    // 1. Кратковременно прижимаем пин к GND, чтобы разрядить ёмкость пустого пина
-    pinMode(PIN_TA12_ADC, OUTPUT);
-    digitalWrite(PIN_TA12_ADC, LOW);
-    delayMicroseconds(5);
-
-    // 2. Переводим пин обратно во вход и даём датчику TA12-200 (800 Ом) выставить своё напряжение
-    pinMode(PIN_TA12_ADC, INPUT_ANALOG);
-    delayMicroseconds(30);
-
-    return analogRead(PIN_TA12_ADC);
-}
-
 // --- Неблокирующий фоновый опрос датчика тока на PA1 ---
 void updateCurrentSensor() {
-    int adcVal = readTa12Adc();
+    // Читаем напрямую через аналоговый вход без переключения режима пина
+    int adcVal = analogRead(PIN_TA12_ADC);
     if (adcVal > currentWindowMaxADC) {
         currentWindowMaxADC = adcVal;
     }
@@ -105,6 +94,7 @@ void updateCurrentSensor() {
         float iMax = ((float)currentWindowMaxADC / ADC_MAX_VALUE) * (V_REF / R_LOAD) * TURNS_RATIO;
         latestMotorCurrentRMS = (iMax / 1.4142f) / WIRE_TURNS;
 
+        // Отсекаем шум АЦП при питании от USB
         if (latestMotorCurrentRMS < 0.08f) {
             latestMotorCurrentRMS = 0.0f;
         }
@@ -122,6 +112,9 @@ void setup() {
     pinMode(PIN_CAMERA_IN, INPUT_PULLDOWN);
     pinMode(PIN_TA12_ADC, INPUT_ANALOG);
 
+    // Сначала задаем выключенное состояние, затем активируем выход
+    digitalWrite(PIN_OUT_OP, RELAY_OFF);
+    digitalWrite(PIN_OUT_PH, RELAY_OFF);
     pinMode(PIN_OUT_OP, OUTPUT);
     pinMode(PIN_OUT_PH, OUTPUT);
 
@@ -129,7 +122,7 @@ void setup() {
     pinMode(PIN_LED_PH, OUTPUT);
     pinMode(PIN_BOARD_LED, OUTPUT);
 
-    // По умолчанию обе линии PB0 и PB1 разомкнуты, синий светодиод PC13 погашен
+    // Обе линии PB0 и PB1 разомкнуты, синий светодиод PC13 погашен (HIGH)
     setDefaultState();
     digitalWrite(PIN_BOARD_LED, HIGH);
 
@@ -147,10 +140,10 @@ void setup() {
 void loop() {
     uint32_t now = millis();
 
-    // 1. Постоянный фоновый замер тока на PA1
+    // 1. Постоянный замер тока на PA1
     updateCurrentSensor();
 
-    // 2. Обработка 5-секундной блокировки входа
+    // 2. Обработка блокировки входа
     if (isLocked) {
         if ((now - lockStartTime) < LOCK_TIME_MS) {
             // Во время блокировки синий светодиод PC13 быстро мигает (каждые 200 мс)
@@ -158,7 +151,7 @@ void loop() {
             digitalWrite(PIN_BOARD_LED, blink ? LOW : HIGH);
             return;
         } else {
-            // 5 секунд истекли — размыкаем обе линии PB0 и PB1
+            // Время блокировки истекло — выключаем оба выхода PB0 и PB1
             isLocked = false;
             setDefaultState();
 
@@ -194,7 +187,7 @@ void loop() {
                     triggerActionWithCurrent();
                 }
 
-                // Блокируем вход на 5 секунд
+                // Блокируем вход
                 isLocked = true;
                 lockStartTime = now;
             }
