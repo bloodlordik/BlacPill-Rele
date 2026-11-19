@@ -1,235 +1,186 @@
 #include <Arduino.h>
+#include "Config.h"
+#include "DebouncedInput.h"
+#include "RelayChannel.h"
+#include "Ta12CurrentSensor.h"
 
-// ================= 1. НАСТРОЙКА ПИНОВ (Black Pill F401CC) =================
-const uint8_t PIN_CAMERA_IN    = PA0;  // Вход сигнала от камеры (подача 3.3V)
-const uint8_t PIN_TA12_ADC     = PA1;  // Вход датчика тока TA12-200 (SIG -> PA1, GND -> G)
+enum class GateState {
+    IDLE,
+    ACTION_OPEN_IDLE,
+    ACTION_PH_MOVING,
+    PASS_RELAY_ON,      // Проход человека: реле пропуска включено на 2 сек
+    PASS_WAIT_DELAY,    // Проход человека: пауза 14 сек перед закрытием
+    PASS_CLOSE_ON       // Проход человека: импульс реле закрытия двери (2 сек)
+};
 
-// Концевики положения ворот (подключаются между пином и GND):
-const uint8_t PIN_LIMIT_OPEN   = PA2;  // Концевик ОТКРЫТО (NC: замкнут на GND, при упоре РАЗМЫКАЕТСЯ)
-const uint8_t PIN_LIMIT_CLOSE  = PA3;  // Концевик ЗАКРЫТО (NC: замкнут на GND, при упоре РАЗМЫКАЕТСЯ)
+// Инициализация входов
+DebouncedInput    camInput(Config::PIN_CAMERA_IN,    INPUT_PULLDOWN, true);  // HIGH = сигнал с камеры
+DebouncedInput    limitOpen(Config::PIN_LIMIT_OPEN,  INPUT_PULLUP,   true);  // HIGH = разомкнут (сработал)
+DebouncedInput    limitClose(Config::PIN_LIMIT_CLOSE, INPUT_PULLUP,  true);  // HIGH = разомкнут (сработал), false = замкнут
+DebouncedInput    btnReset(Config::PIN_RESET_BUTTON, INPUT_PULLUP,   false); // LOW  = кнопка нажата
+DebouncedInput    doorInput(Config::PIN_DOOR_IN,     INPUT_PULLUP,   false); // LOW  = контакт PERCo замкнут на GND (NO)
 
-const uint8_t PIN_OUT_OP       = PB0;  // Выход PB0 (OP: Открытие/Старт)
-const uint8_t PIN_OUT_PH       = PB1;  // Выход PB1 (PH: Оптическая линия)
+Ta12CurrentSensor motorSensor(Config::PIN_TA12_ADC);
 
-const uint8_t PIN_LED_OP       = PA6;  // Светодиод индикации PB0
-const uint8_t PIN_LED_PH       = PA7;  // Светодиод индикации PB1
-const uint8_t PIN_BOARD_LED    = PC13; // Встроенный светодиод платы (Active LOW: LOW = горит)
+// Основные реле ворот (Open Drain)
+RelayChannel      relayOp(Config::PIN_OUT_OP, Config::PIN_LED_OP, Config::RELAY_ACTIVE_HIGH, OUTPUT_OPEN_DRAIN);
+RelayChannel      relayPh(Config::PIN_OUT_PH, Config::PIN_LED_PH, Config::RELAY_ACTIVE_HIGH, OUTPUT_OPEN_DRAIN);
 
-// ================= 2. НАСТРОЙКА РЕЛЕ И ВРЕМЕНИ =================
-// Если модуль реле управляется нулем (Active LOW) — ставим false
-const bool RELAY_ACTIVE_HIGH   = false; 
+// Реле режима прохода человека (Open Drain)
+RelayChannel      relayPass(Config::PIN_OUT_PASS, RelayChannel::NO_LED, Config::RELAY_ACTIVE_HIGH, OUTPUT_OPEN_DRAIN);
+RelayChannel      relayCloseDoor(Config::PIN_OUT_CLOSE_DR, RelayChannel::NO_LED, Config::RELAY_ACTIVE_HIGH, OUTPUT_OPEN_DRAIN);
 
-const uint32_t DEBOUNCE_MS     = 25;    // Фильтр дребезга камеры и концевиков (25 мс)
-const uint32_t DEAD_TIME_MS    = 5;     // Защитная пауза переключения реле (5 мс)
-const uint32_t LOCK_TIME_MS    = 25000; // Базовое максимальное время хода ворот (25 сек)
+GateState currentState   = GateState::IDLE;
+uint32_t  stateStartTime = 0;
 
-// Параметры датчика тока TA12-200
-const float V_REF              = 3.3f;
-const float ADC_MAX_VALUE      = 4095.0f;
-const float R_LOAD             = 800.0f;
-const float TURNS_RATIO        = 2000.0f;
-const float WIRE_TURNS         = 1.0f;
-
-const float MOTOR_CURRENT_THRESHOLD_A = 0.15f; // Порог обнаружения тока двигателя
-const uint32_t CURRENT_WINDOW_MS      = 100;
-
-// ================= 3. ПЕРЕМЕННЫЕ СОСТОЯНИЯ =================
-const uint8_t RELAY_ON  = RELAY_ACTIVE_HIGH ? HIGH : LOW;
-const uint8_t RELAY_OFF = RELAY_ACTIVE_HIGH ? LOW  : HIGH;
-
-uint32_t adcWindowStart       = 0;
-int currentWindowMaxADC       = 0;
-float latestMotorCurrentRMS   = 0.0f;
-bool isMotorRunning           = false;
-
-bool lastRawCamera            = false;
-bool stableCameraState        = false;
-uint32_t lastCameraDebounce   = 0;
-
-bool isLocked                 = false;
-uint32_t lockStartTime        = 0;
-
-// Переменные концевика открытия (NC: LOW = замкнут/норма, HIGH = разомкнут/сработал)
-bool lastRawLimitOpen         = false;
-bool stableLimitOpen          = false;
-uint32_t lastLimitDebounce     = 0;
-
-// --- Состояние по умолчанию: обе линии PB0 и PB1 отключены ---
-void setDefaultState() {
-    digitalWrite(PIN_OUT_OP, RELAY_OFF);
-    digitalWrite(PIN_LED_OP, LOW);
-    delay(DEAD_TIME_MS);
-
-    digitalWrite(PIN_OUT_PH, RELAY_OFF);
-    digitalWrite(PIN_LED_PH, LOW);
+void stopPassRelays() {
+    relayPass.off();
+    relayCloseDoor.off();
 }
 
-// --- Сценарий 1: ТОКА НЕТ (ворота стоят) -> Подаем сигнал на PB0 (OP) ---
-void triggerActionGateIdle() {
-    digitalWrite(PIN_OUT_PH, RELAY_OFF);
-    digitalWrite(PIN_LED_PH, LOW);
-    delay(DEAD_TIME_MS);
-
-    digitalWrite(PIN_OUT_OP, RELAY_ON);
-    digitalWrite(PIN_LED_OP, HIGH);
+void enterIdleState() {
+    relayOp.off();
+    stopPassRelays();
+    delay(Config::DEAD_TIME_MS);
+    relayPh.off();
+    currentState = GateState::IDLE;
 }
 
-// --- Сценарий 2: ТОК ЕСТЬ (ворота уже в пути) -> Подаем сигнал на PB1 (PH) ---
-void triggerActionGateMoving() {
-    digitalWrite(PIN_OUT_OP, RELAY_OFF);
-    digitalWrite(PIN_LED_OP, LOW);
-    delay(DEAD_TIME_MS);
-
-    digitalWrite(PIN_OUT_PH, RELAY_ON);
-    digitalWrite(PIN_LED_PH, HIGH);
+void enterActionOpenState(uint32_t now) {
+    stopPassRelays();
+    relayPh.off();
+    delay(Config::DEAD_TIME_MS);
+    relayOp.on();
+    currentState   = GateState::ACTION_OPEN_IDLE;
+    stateStartTime = now;
 }
 
-// --- Безопасный замер тока на PA1 с подавлением наводок ---
-int readTa12Adc() {
-    pinMode(PIN_TA12_ADC, OUTPUT);
-    digitalWrite(PIN_TA12_ADC, LOW);
-    delayMicroseconds(5);
-
-    pinMode(PIN_TA12_ADC, INPUT_ANALOG);
-    delayMicroseconds(30);
-
-    return analogRead(PIN_TA12_ADC);
+void enterActionPhState(uint32_t now) {
+    stopPassRelays();
+    relayOp.off();
+    delay(Config::DEAD_TIME_MS);
+    relayPh.on();
+    currentState   = GateState::ACTION_PH_MOVING;
+    stateStartTime = now;
 }
 
-void updateCurrentSensor() {
-    int adcVal = readTa12Adc();
-    if (adcVal > currentWindowMaxADC) {
-        currentWindowMaxADC = adcVal;
-    }
+void startHumanPass(uint32_t now) {
+    relayCloseDoor.off();
+    delay(Config::DEAD_TIME_MS);
+    relayPass.on();
+    currentState   = GateState::PASS_RELAY_ON;
+    stateStartTime = now;
+}
 
-    uint32_t now = millis();
-    if ((now - adcWindowStart) >= CURRENT_WINDOW_MS) {
-        float iMax = ((float)currentWindowMaxADC / ADC_MAX_VALUE) * (V_REF / R_LOAD) * TURNS_RATIO;
-        latestMotorCurrentRMS = (iMax / 1.4142f) / WIRE_TURNS;
-
-        if (latestMotorCurrentRMS < 0.05f) {
-            latestMotorCurrentRMS = 0.0f;
-        }
-
-        isMotorRunning = (latestMotorCurrentRMS >= MOTOR_CURRENT_THRESHOLD_A);
-
-        currentWindowMaxADC = 0;
-        adcWindowStart = now;
+void updateBoardLed(uint32_t now) {
+    if (currentState != GateState::IDLE) {
+        bool blink = ((now / Config::BLINK_INTERVAL_MS) % 2) == 0;
+        digitalWrite(Config::PIN_BOARD_LED, blink ? LOW : HIGH);
+    } else {
+        digitalWrite(Config::PIN_BOARD_LED, motorSensor.isMotorRunning() ? LOW : HIGH);
     }
 }
 
 void setup() {
     analogReadResolution(12);
+    pinMode(Config::PIN_BOARD_LED, OUTPUT);
+    digitalWrite(Config::PIN_BOARD_LED, HIGH);
 
-    pinMode(PIN_CAMERA_IN, INPUT_PULLDOWN);
-    pinMode(PIN_TA12_ADC, INPUT_ANALOG);
+    relayOp.begin();
+    relayPh.begin();
+    relayPass.begin();
+    relayCloseDoor.begin();
 
-    // Входы концевиков с внутренней подтяжкой к 3.3V
-    // Пока концевик замкнут на GND — там LOW. Когда разомкнулся — становится HIGH.
-    pinMode(PIN_LIMIT_OPEN, INPUT_PULLUP);
-    pinMode(PIN_LIMIT_CLOSE, INPUT_PULLUP);
+    camInput.begin();
+    limitOpen.begin();
+    limitClose.begin();
+    btnReset.begin();
+    doorInput.begin();
+    motorSensor.begin();
 
-    // Режим OUTPUT_OPEN_DRAIN защитит от залипания реле при питании от 5V
-    pinMode(PIN_OUT_OP, OUTPUT_OPEN_DRAIN);
-    pinMode(PIN_OUT_PH, OUTPUT_OPEN_DRAIN);
-
-    pinMode(PIN_LED_OP, OUTPUT);
-    pinMode(PIN_LED_PH, OUTPUT);
-    pinMode(PIN_BOARD_LED, OUTPUT);
-
-    setDefaultState();
-    digitalWrite(PIN_BOARD_LED, HIGH);
-
-    // Стартовый замер тока
-    uint32_t startup = millis();
-    adcWindowStart = startup;
-    while ((millis() - startup) < 120) {
-        updateCurrentSensor();
-    }
-
-    lastRawCamera = (digitalRead(PIN_CAMERA_IN) == HIGH);
-    stableCameraState = lastRawCamera;
-
-    stableLimitOpen = (digitalRead(PIN_LIMIT_OPEN) == HIGH);
-    lastRawLimitOpen = stableLimitOpen;
+    enterIdleState();
 }
 
 void loop() {
     uint32_t now = millis();
 
-    // 1. Фоновое обновление датчика тока
-    updateCurrentSensor();
+    // 1. Опрос всех датчиков, концевиков и кнопок
+    motorSensor.update(now);
+    camInput.update(now);
+    limitOpen.update(now);
+    limitClose.update(now);
+    btnReset.update(now);
+    doorInput.update(now);
 
-    // 2. Чтение концевика открытого положения (PA2) с антидребезгом
-    bool rawLimitOpen = (digitalRead(PIN_LIMIT_OPEN) == HIGH); // true = контакт разомкнут (ворота дошли)
-    if (rawLimitOpen != lastRawLimitOpen) {
-        lastLimitDebounce = now;
-        lastRawLimitOpen = rawLimitOpen;
-    }
-    if ((now - lastLimitDebounce) >= DEBOUNCE_MS) {
-        stableLimitOpen = rawLimitOpen;
-    }
+    // 2. ВЫСШИЙ ПРИОРИТЕТ: сигнал от камеры (PA0)
+    // Срабатывает в IDLE и мгновенно прерывает любой этап прохода человека
+    bool isIdleOrHumanPass = (currentState == GateState::IDLE ||
+                              currentState == GateState::PASS_RELAY_ON ||
+                              currentState == GateState::PASS_WAIT_DELAY ||
+                              currentState == GateState::PASS_CLOSE_ON);
 
-    // 3. Обработка блокировки и контроль времени движения
-    if (isLocked) {
-        // УСЛОВИЕ ДОСРОЧНОГО СБРОСА:
-        // Если сработал концевик открытия (разомкнулся -> HIGH) — сбрасываем таймер немедленно!
-        if (stableLimitOpen) {
-            isLocked = false;
-            setDefaultState();
-            digitalWrite(PIN_BOARD_LED, HIGH);
-
-            // Синхронизируем состояние входа камеры
-            lastRawCamera = (digitalRead(PIN_CAMERA_IN) == HIGH);
-            stableCameraState = lastRawCamera;
-            lastCameraDebounce = now;
-            return;
-        }
-
-        // Если концевик еще не сработал — проверяем предельный таймер 25 секунд
-        if ((now - lockStartTime) < LOCK_TIME_MS) {
-            bool blink = ((now / 200) % 2) == 0;
-            digitalWrite(PIN_BOARD_LED, blink ? LOW : HIGH);
-            return; // Вход камеры пока заблокирован
+    if (isIdleOrHumanPass && camInput.rose() && !limitOpen.isActive()) {
+        if (!motorSensor.isMotorRunning()) {
+            enterActionOpenState(now);
         } else {
-            // 25 секунд истекли по таймауту (например, если концевик не сработал)
-            isLocked = false;
-            setDefaultState();
-
-            lastRawCamera = (digitalRead(PIN_CAMERA_IN) == HIGH);
-            stableCameraState = lastRawCamera;
-            lastCameraDebounce = now;
+            enterActionPhState(now);
         }
+        updateBoardLed(now);
+        return;
     }
 
-    // В дежурном режиме светодиод PC13 горит только при наличии тока на моторе
-    digitalWrite(PIN_BOARD_LED, isMotorRunning ? LOW : HIGH);
-
-    // 4. Опрос сигнала от камеры на PA0
-    bool rawCamera = (digitalRead(PIN_CAMERA_IN) == HIGH);
-    if (rawCamera != lastRawCamera) {
-        lastCameraDebounce = now;
-        lastRawCamera = rawCamera;
-    }
-
-    if ((now - lastCameraDebounce) >= DEBOUNCE_MS) {
-        if (rawCamera != stableCameraState) {
-            stableCameraState = rawCamera;
-
-            if (stableCameraState) {
-                // Если ворота уже полностью открыты (концевик PA2 разомкнут),
-                // не пытаемся подавать команду на открытие повторно
-                if (!stableLimitOpen) {
-                    if (!isMotorRunning) {
-                        triggerActionGateIdle();
-                    } else {
-                        triggerActionGateMoving();
-                    }
-
-                    isLocked = true;
-                    lockStartTime = now;
-                }
+    // 3. Конечный автомат управления воротами и проходом человека
+    switch (currentState) {
+        case GateState::IDLE: {
+            // Концевик закрытия замкнут (!limitClose.isActive()) + замыкание контакта PERCo (doorInput)
+            bool isGateClosed = !limitClose.isActive();
+            if (doorInput.rose() && isGateClosed) {
+                startHumanPass(now);
             }
+            break;
+        }
+
+        case GateState::PASS_RELAY_ON:
+            if (btnReset.isActive()) {
+                enterIdleState();
+            } else if ((now - stateStartTime) >= Config::PASS_OPEN_MS) {
+                // Прошло 2 сек -> выключаем реле прохода, начинаем отсчёт 14 сек
+                relayPass.off();
+                currentState   = GateState::PASS_WAIT_DELAY;
+                stateStartTime = now;
+            }
+            break;
+
+        case GateState::PASS_WAIT_DELAY:
+            if (btnReset.isActive()) {
+                enterIdleState();
+            } else if ((now - stateStartTime) >= Config::PASS_WAIT_CLOSE_MS) {
+                // Прошло 14 сек -> включаем реле закрытия двери
+                relayCloseDoor.on();
+                currentState   = GateState::PASS_CLOSE_ON;
+                stateStartTime = now;
+            }
+            break;
+
+        case GateState::PASS_CLOSE_ON:
+            if (btnReset.isActive() || (now - stateStartTime) >= Config::PASS_CLOSE_MS) {
+                // Завершили импульс закрытия двери -> возврат в дежурный режим
+                enterIdleState();
+            }
+            break;
+
+        case GateState::ACTION_OPEN_IDLE:
+        case GateState::ACTION_PH_MOVING: {
+            bool timeoutExpired = (now - stateStartTime) >= Config::LOCK_TIME_MS;
+
+            // Досрочный выход по концевику открытия, кнопке сброса (PA4) или таймауту 25 сек
+            if (limitOpen.isActive() || btnReset.isActive() || timeoutExpired) {
+                enterIdleState();
+            }
+            break;
         }
     }
+
+    // 4. Обновление светодиода PC13
+    updateBoardLed(now);
 }
