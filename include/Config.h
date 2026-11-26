@@ -3,7 +3,7 @@
 
 namespace Config {
     // --- Входы (Black Pill F401CC) ---
-    constexpr uint8_t PIN_CAMERA_IN    = PA0;  // Вход сигнала от камеры (3.3V)
+    constexpr uint8_t PIN_CAMERA_IN    = PA0;  // нормально разомкнут
     constexpr uint8_t PIN_TA12_ADC     = PA1;  // Датчик тока TA12-200
     constexpr uint8_t PIN_LIMIT_OPEN   = PA2;  // Концевик ОТКРЫТО (NC: разомкнут = HIGH)
     constexpr uint8_t PIN_LIMIT_CLOSE  = PA3;  // Концевик ЗАКРЫТО (NC: замкнут = LOW, разомкнут = HIGH)

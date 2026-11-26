@@ -14,9 +14,9 @@ enum class GateState {
 };
 
 // Инициализация входов
-DebouncedInput    camInput(Config::PIN_CAMERA_IN,    INPUT_PULLDOWN, true);  // HIGH = сигнал с камеры
+DebouncedInput    camInput(Config::PIN_CAMERA_IN,    INPUT_PULLUP, false);  // HIGH = сигнал с камеры
 DebouncedInput    limitOpen(Config::PIN_LIMIT_OPEN,  INPUT_PULLUP,   true);  // HIGH = разомкнут (сработал)
-DebouncedInput    limitClose(Config::PIN_LIMIT_CLOSE, INPUT_PULLUP,  true);  // HIGH = разомкнут (сработал), false = замкнут
+DebouncedInput    limitClose(Config::PIN_LIMIT_CLOSE, INPUT_PULLUP,  false);  // HIGH = разомкнут (сработал), false = замкнут
 DebouncedInput    btnReset(Config::PIN_RESET_BUTTON, INPUT_PULLUP,   false); // LOW  = кнопка нажата
 DebouncedInput    doorInput(Config::PIN_DOOR_IN,     INPUT_PULLUP,   false); // LOW  = контакт PERCo замкнут на GND (NO)
 
